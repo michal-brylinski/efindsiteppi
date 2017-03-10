@@ -1,2 +1,2 @@
-# efindsiteppi
+# eFindSitePPI
 Protein binding site prediction
