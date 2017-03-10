@@ -1,0 +1,1030 @@
+# This is a shell archive.  Save it in a file, remove anything before
+# this line, and then unpack it by entering "sh file".  Note, it may
+# create directories; files and directories will be owned by you and
+# have default permissions.
+#
+# This archive contains:
+#
+#	efindsiteppi
+#
+echo x - efindsiteppi
+sed 's/^X//' >efindsiteppi << 'END-of-efindsiteppi'
+X#!/project/michal/apps/perl/bin/perl
+X##!/usr/bin/perl -w
+X# here the input ethread-2.0 file has a list of templates along with predicted MCC & IS-Score.
+X# Random forest was used for mcc & isc prediction
+X
+X#===============================================================================
+X#        ______ _           _  _____ _ _       _____  _____ _____ 
+X#       |  ____(_)         | |/ ____(_) |     |  __ \|  __ \_   _|
+X#    ___| |__   _ _ __   __| | (___  _| |_ ___| |__) | |__) || |  
+X#   / _ \  __| | | '_ \ / _` |\___ \| | __/ _ \  ___/|  ___/ | |  
+X#  |  __/ |    | | | | | (_| |____) | | ||  __/ |    | |    _| |_ 
+X#   \___|_|    |_|_| |_|\__,_|_____/|_|\__\___|_|    |_|   |_____|
+X#                                                  
+X#   eFindSitePPI - prediction of protein binding sites from meta-threading
+X#
+X#   This software is distributed WITHOUT ANY WARRANTY (but with best wishes)
+X#
+X#   Report bugs and issues to smahes2@tigers.lsu.edu michal@brylinski.org
+X#
+X#   Computational Systems Biology Group
+X#   Department of Biological Sciences
+X#   Center for Computation & Technology
+X#   Louisiana State University
+X#   407 Choppin Hall, Baton Rouge, LA 70803, USA
+X#
+X#   http://www.brylinski.org
+X#
+X#===============================================================================
+X
+Xuse strict;
+Xuse warnings ;
+Xuse Benchmark;
+Xuse File::Slurp;
+Xuse Cwd;
+Xuse File::Copy;
+Xuse File::Temp qw/ tempfile tempdir /;
+Xuse IO::Uncompress::Gunzip qw(gunzip $GunzipError) ;
+Xuse Algorithm::NeedlemanWunsch;
+Xuse List::Util qw( min max );
+Xuse AI::NaiveBayes1;
+Xuse YAML;
+X
+X local $| = 1;
+X
+X print "------------------------------------------------------------\n";
+X print "                        efindsiteppi\n";
+X print "                        version 1.1\n";
+X print "              protein binding site prediction\n\n";
+X print "       report bugs and issues to smahes2\@lsu.edu\n";
+X print "                                 michal\@brylinski.org\n";
+X print "------------------------------------------------------------\n\n";
+X 
+X die "PPI_FRTMALIGN is not set\n" if !( $ENV{'PPI_FRTMALIGN'} );
+X die "PPI_NACCESS is not set\n" if !( $ENV{'PPI_NACCESS'} );
+X die "PPI_LIBSVM is not set\n" if !( $ENV{'PPI_LIBSVM'} );
+X die "PPI_MODELS is not set\n" if !( $ENV{'PPI_MODELS'} );
+X die "PPI_LIBRARY is not set\n" if !( $ENV{'PPI_LIBRARY'} );
+X 
+X if ($#ARGV < 4)
+X {
+X  print "efindsiteppi.pl -s <target structure in PDB format>\n";
+X  print "                -t <output from eThread>\n";
+X  print "		-e <sequence profile>\n";
+X  print " 		-o <output filename>\n\n";
+X  print "additional options:\n\n";
+X  print "      	  	-b <sequence identity threshold for benchmarks, default 1.0>\n";
+X  print "        	-m <TMscore threshold, default 0.4>\n";
+X  print "        	-x <max number of templates, default 1000>\n";
+X  print "        	-c <predicted mcc threshold, default 0.20>\n";
+X  die "\n";
+X }
+X
+X my $env_frtmalign = $ENV{'PPI_FRTMALIGN'};
+X my $env_naccess = $ENV{'PPI_NACCESS'};
+X my $env_libsvm = $ENV{'PPI_LIBSVM'};
+X my $env_tempdataset = $ENV{'PPI_LIBRARY'};
+X my $env_svm = ($ENV{'PPI_MODELS'}.'/residueSVM.model');
+X my $env_nb = ($ENV{'PPI_MODELS'}.'/residueNBC.model');
+X
+X die "Could not find frtmalign\n" if ( !( -e $env_frtmalign ) );
+X die "Could not find naccess\n" if ( !( -e $env_naccess ) );
+X die "Could not find svm-predict\n" if ( !( -e $env_libsvm ) );
+X die "Could not find template library\n" if ( !( -d $env_tempdataset ));
+X die "Could not find SVM model\n" if ( !( -e $env_svm ) );
+X die "Could not find NBC model\n" if ( !( -e $env_nb ) );
+X 
+X my $thresh_tmscore = 0.40 ;
+X my $thresh_seqid = 1.00;
+X my $thresh_temp = 200;
+X my $thresh_mcc = 0.20;
+X 
+X my $i; my $efile=''; my $sfile=''; my $target_id='';my $ffile='';my $pfile='';
+X for ($i = 0; $i <= $#ARGV; $i++)
+X {
+X     if ($ARGV[$i] eq '-t') {$efile = $ARGV[$i+1] ;} 
+X  elsif ($ARGV[$i] eq '-s') {$sfile = $ARGV[$i+1] ;}
+X  elsif ($ARGV[$i] eq '-o') {$target_id = $ARGV[$i+1] ;}
+X  elsif ($ARGV[$i] eq '-e') {$pfile = $ARGV[$i+1] ;}
+X  elsif ($ARGV[$i] eq '-b') {$thresh_seqid = $ARGV[$i+1] ;}
+X  elsif ($ARGV[$i] eq '-m') {$thresh_tmscore = $ARGV[$i+1] ;}
+X  elsif ($ARGV[$i] eq '-x') {$thresh_temp = $ARGV[$i+1] ;}
+X  elsif ($ARGV[$i] eq '-c') {$thresh_mcc = $ARGV[$i+1] ;}
+X }
+X 
+X die "Provide target structure in PDB format\n" if ( !( -e $sfile ) );
+X die "Provide output from eThread\n" if ( !( -e $efile ) );
+X die "Provide sequence profile\n" if ( !( -e $pfile ) );
+X die "Provide output filename\n" if ( !( length($target_id) ) );
+X 
+X printf("!!! Benchmarking mode activated with max sid of %.2f !!!\n\n", $thresh_seqid) if ( $thresh_seqid < 1.0 );
+X 
+X my @version1 = read_file($env_tempdataset.'/version.info'); chomp(@version1);
+X my $dir1 = getcwd();
+X my $dir2 = tempdir(CLEANUP => 1);
+X 
+X print "Tempdir created: $dir2\n\n";
+X 
+X print "eFindSitePPI library path: $env_tempdataset\n";
+X print "eFindSitePPI library version: $version1[0]\n\n";
+X 
+X#NOTE:Target pdb should have only 1 chain , the "receptor"
+X##section1#################################################################################################
+X## Reading input files 
+X 
+X my $t0 = Benchmark->new; 
+X
+X print "Reading input files ... ";
+X
+X my @target_pdb1 = read_file($sfile);
+X my @target_pdb = grep(/^ATOM/,@target_pdb1);
+X 
+X # fix chain id
+X 
+X foreach my $wtarget_pdb (@target_pdb)
+X {
+X  substr($wtarget_pdb, 21, 1) = 'A' if ( substr($wtarget_pdb, 21, 1) eq ' ' );
+X }
+X 
+X my @ethread = read_file($efile);
+X my @prf = read_file($pfile);
+X
+X my %h0 = (); my $key0 = ();
+X
+X print "done\n\n";
+X
+X##section2.1###############################################################################################
+X## Making a function for finding TM-score
+X## usage > tmscore(template.pdb,target.pdb);
+X
+X sub tmscore 
+X {
+X   #my $tm_score = '/project/michal/apps/frtmalign/frtmalign';
+X   #my $tm_score = '/usr/local/frtmalign/frtmalign';
+X   my $tm_score =$env_frtmalign;
+X   open (FH, "$tm_score -m 1 $_[0] $_[1] 2>&1 |");
+X     my @tmscore_out = <FH>;
+X   close FH ; 
+X   my @grep_tms1 = grep(/TM-score=/,@tmscore_out);
+X   my @split_tms1 = split(/ +/,$grep_tms1[0]);
+X   my $tmscore1 = $split_tms1[5];   
+X   $tmscore1 =~ s/,// ; $tmscore1 =~ s/TM-score=//;
+X   my $aln_length1= $split_tms1[2];$aln_length1 =~ s/,// ;
+X   my $rmsd1 = $split_tms1[4]; $rmsd1 =~ s/,// ;
+X   my $seq_id1 = $split_tms1[6]; chomp $seq_id1;$seq_id1 =~ s/,// ;$seq_id1 =~ s/ID=//; 
+X   my $aln_temp1 = $tmscore_out[16];chomp $aln_temp1;
+X   my $aln_dots1 = $tmscore_out[17];chomp $aln_dots1;
+X   my $aln_targ1 = $tmscore_out[18];
+X   my @mat = read_file("trf.mat") if ( -e "trf.mat" );
+X   my @grep_tms2 = grep(/Chain 1/,@tmscore_out);
+X   my @split_tms2 = split(/ +/,$grep_tms2[0]);
+X   # my $length_temp1 = $split_tms2[3];chomp $length_temp1;
+X   my $length_temp1=substr($grep_tms2[0],25,4)*1;
+X   my @grep_tms3 = grep(/Chain 2/,@tmscore_out);
+X   my @split_tms3 = split(/ +/,$grep_tms3[0]);
+X   # my $length_targ1 = $split_tms3[3];chomp $length_targ1;
+X    my $length_targ1=substr($grep_tms3[0],25,4)*1;
+X   return ($length_targ1,$length_temp1,$tmscore1,$rmsd1,$aln_length1,$seq_id1,$aln_temp1,$aln_dots1,$aln_targ1,@mat);      
+X  }
+X
+X##section2.2###############################################################################################
+X## Translate PDB files to sequence string file
+X## usage > pdb2seq(@input_pdb_array);
+X
+X sub pdb2seq
+X  {
+X  my %aa=qw(
+X	ALA 	A
+X	CYS 	C
+X	ASP 	D
+X	GLU 	E 
+X	PHE 	F
+X	GLY	G
+X	HIS	H
+X	ILE	I
+X	LYS	K
+X	LEU	L
+X	MET	M
+X	ASN	N
+X	PRO	P
+X	GLN	Q
+X	ARG	R
+X	SER	S
+X	THR	T
+X	VAL	V
+X	TRP	W
+X	TYR	Y);
+X
+X  my @pdb_in = @_;my $residue ; my $resno;
+X  my $oldresno=-1;my $seq=(); #print "@pdb_in";
+X  foreach (@pdb_in)
+X   {
+X    if (/^ATOM/)
+X    {
+X     my $type = substr($_,13,2); 
+X     if ($type eq "CA")	
+X      {	
+X       my $res = substr($_, 17, 3); 
+X       chomp($residue=$aa{$res});$residue=~ s/^\s+//;$residue=~s/\s+$//;
+X       my $resno=substr($_, 22, 4);
+X       if ($resno>$oldresno)
+X        {
+X         $seq=$seq.$residue ; 
+X         $oldresno=$resno;
+X         }
+X       }
+X     }
+X    }
+X   return $seq;
+X   }
+X
+X##section2.3###############################################################################################
+X# Gives the global sequence identity between two sequence strings.
+X# usage > get_identity(seq_string1, seq_string2);
+X
+X use vars qw( %nwmat4 @nwseq3 @nwseq4 $nwseq3o $nwseq4o );
+X my %nwmat1 = (); 
+X my @nwmat3 = qw(A  R  N  D  C  Q  E  G  H  I  L  K  M  F  P  S  T  W  Y  V  B  Z  X);
+X 
+X while ( my $wdat1 = <DATA> )
+X {
+X  chomp $wdat1;
+X  if ( length($wdat1) == 70 and $wdat1 ne '   A  R  N  D  C  Q  E  G  H  I  L  K  M  F  P  S  T  W  Y  V  B  Z  X' )
+X  {
+X   my $nwr1 = substr($wdat1, 0, 1);   
+X   for ( my $xg = 0; $xg < 23; $xg++ )
+X   {
+X    $nwmat1{$nwr1.$nwmat3[$xg]} = substr($wdat1, 1 + $xg * 3, 3) * 1;
+X   }
+X  }
+X }
+X 
+X my @nwseq1 = ();my @nwseq2 = ();
+X my $nwseq1o = '';my $nwseq2o = '';
+X 
+X sub blosum 
+X { 
+X  my ($anw, $bnw) = @_;  
+X  my $snw = 0;  
+X  $snw = $nwmat1{$anw.$bnw} if ( exists $nwmat1{$anw.$bnw} );  
+X  return ($snw);
+X }
+X 
+X my $matcher1 = Algorithm::NeedlemanWunsch->new(\&blosum);
+X $matcher1->gap_open_penalty(-10);
+X $matcher1->gap_extend_penalty(-2);
+X 
+X sub prepend_align1 
+X { 
+X  my ($i, $j) = @_;
+X  $nwseq1o = $nwseq1[$i] . $nwseq1o;
+X  $nwseq2o = $nwseq2[$j] . $nwseq2o;
+X }
+X 
+X sub prepend_first_only1 
+X { 
+X  my $i = shift;  
+X  $nwseq1o = $nwseq1[$i] . $nwseq1o;
+X  $nwseq2o = "-$nwseq2o";
+X }
+X 
+X sub prepend_second_only1 
+X {
+X  my $j = shift;
+X  $nwseq1o = "-$nwseq1o";
+X  $nwseq2o = $nwseq2[$j] . $nwseq2o;
+X }
+X 
+X sub get_identity 
+X {
+X  my ($iseq1, $iseq2) = @_;  
+X  my $iss = 0.0; 
+X  @nwseq1 = split(//, $iseq1);
+X  @nwseq2 = split(//, $iseq2);
+X  
+X  $nwseq1o = '';$nwseq2o = '';
+X 
+X  my $score = $matcher1->align(\@nwseq1, \@nwseq2, { align => \&prepend_align1, shift_a => \&prepend_first_only1, shift_b => \&prepend_second_only1, });
+X  
+X  my @nwseq1a = split(//, $nwseq1o);
+X  my @nwseq2a = split(//, $nwseq2o);
+X  
+X  my $niseq1 = @nwseq1a;my $niseq2 = @nwseq2a;
+X  my $isid1 = 0; my $isid2 = 0;
+X  
+X  if ( $niseq1 == $niseq2 )
+X  {
+X   for ( my $ixa = 0; $ixa < $niseq1; $ixa++ )
+X   {
+X    $isid1++ if ( $nwseq1a[$ixa] ne '-' and $nwseq2a[$ixa] ne '-' and $nwseq1a[$ixa] eq $nwseq2a[$ixa] );
+X    $isid2++ if ( $nwseq1a[$ixa] ne '-' and $nwseq2a[$ixa] ne '-' );
+X   }
+X  }
+X  
+X  $iss = $isid1 / $isid2 if ( $isid2 );  
+X  return $iss;
+X }
+X
+X##section2.4############################################################################################### 
+X
+X sub map_alignments
+X   {
+X    my $aln_target = $_[0];
+X    my $aln_template = $_[1];
+X    my %hash1 = %{$_[2]};
+X    my %hash2 = %{$_[3]};
+X    my $target_length = $_[4];
+X    my $length =  length ($aln_target);
+X    my $m1 = 0 ; my $m2 =0;
+X    for (my $i=0; $i<= $length; $i++)
+X     {
+X      my $count_m1=0; my $count_m2=0;
+X      if ( substr($aln_target,$i,1) ne '-') { $m1++; $count_m1 = 1;}
+X      if ( substr($aln_template,$i,1) ne '-') { $m2++; $count_m2 = 1;}
+X      if ( exists $hash1{$m2} && $count_m1 == 1 && $count_m2 == 1 && $m1 <= $target_length)
+X       {
+X         if (exists $hash2{$m1})
+X          {
+X           $hash2{$m1}=$hash2{$m1}.":".$hash1{$m2};
+X           }
+X         else 
+X          {
+X           $hash2{$m1}=$hash1{$m2}; 
+X           } 
+X        }
+X       elsif ( !exists $hash1{$m2} && $count_m1 == 1 && $count_m2 == 1 && $m1 <= $target_length)
+X        {
+X         if (exists $hash2{$m1})
+X          {
+X           $hash2{$m1}=$hash2{$m1}.":"."0";
+X           }
+X         else 
+X          {
+X           $hash2{$m1}="0"; 
+X           }
+X         }
+X       }
+X    return \%hash2 ; 
+X   }
+X
+X  sub find_fraction
+X   {
+X    my %hash3 = %{$_[0]};
+X    my %hash4 = () ;
+X    foreach my $key (keys %hash3)
+X      {
+X       my @split = split(/:/,$hash3{$key});
+X       my $denominator=0;
+X       foreach (@split)
+X         {
+X          if ($_ == 0){$denominator = $denominator+1 ;}
+X          else {$denominator = $denominator + $_ ;}        
+X          }
+X       my $sum=0; my $fraction=0;
+X       if ($denominator > 0)
+X        {
+X         foreach (@split)
+X         {
+X         $sum= $sum + $_;
+X         }
+X        $fraction = ($sum/$denominator) ;
+X        $hash4{$key}=$fraction; 
+X        }
+X      }
+X    return \%hash4 ;
+X    }
+X
+X##section2.5############################################################################################### 
+X
+X sub scale 
+X  {
+X  my $in = $_[0] ;
+X  my $lb = $_[1]  ;
+X  my $ub = $_[2] ;
+X  my $out = ($in - $lb)/($ub-$lb)* 2.0 - 1.0;
+X  $out = -1.0 if ( $out < -1.0 );
+X  $out = 1.0 if ( $out > 1.0 );
+X  return $out;
+X  }
+X
+X##section3.1###############################################################################################
+X## Finding the TM-score of all the templates identified in the ethread file (mapped on ethread mapping file)
+X
+Xprint "Calculating structure alignments .";
+X
+X my $target_seq = pdb2seq(@target_pdb);
+X
+X my %ethread_mcc;  my %ethread_isc;
+X my @count_template ; my $count_temp;
+X my @ethread1 = grep (!/mcc/,@ethread);
+X foreach ( @ethread1)
+X {
+X  my @split_thread = split (/\s+/,$_);
+X  my $ethread_temp = $split_thread[0]; # finds the pdbid of the template
+X  my $predicted_mcc = $split_thread[1]; chomp $predicted_mcc; 
+X  my $predicted_isc = $split_thread[2]; chomp $predicted_isc; 
+X  $ethread_mcc{$ethread_temp}=$predicted_mcc*1 ; 
+X  $ethread_isc{$ethread_temp}=$predicted_isc*1 ; 
+X
+X  }
+X
+X 
+X my ($fh0, $tmpfil0); 
+X ($fh0, $tmpfil0) = tempfile( DIR => $dir2,SUFFIX => ".pdb", UNLINK => 1);
+X write_file( $tmpfil0, @target_pdb ) ;
+X chdir $dir2; 
+X
+X my $target_length ; my $k1 = 0; 
+X my (%h1, $value1, $key1,%h2,$value2,%h3,$value3,%h4,%h20);
+X my (%hbond, %salt,%contacts);
+X my (%h5,%h6);
+X foreach my $template (reverse sort { $ethread_mcc{$a} <=> $ethread_mcc{$b} } keys(%ethread_mcc) )
+X { 
+X  if ($k1 < $thresh_temp && $ethread_mcc{$template}>$thresh_mcc)
+X  { 
+X   $value1=();$key1=();
+X   $template=~ s/^\s+|\s+$//g;
+X   chomp $template;
+X   my $file1 = $env_tempdataset.'/data/'.substr($template, 1, 2).'/'.$template.'.gz'; 
+X    if (-e $file1)
+X      {
+X             my ($fh1, $tmpfil1) = tempfile( DIR => $dir2, UNLINK => 1);
+X             my ($fh2, $output_filename) = tempfile( DIR => $dir2, UNLINK => 1);
+X 
+X             gunzip $file1 => $output_filename  or die "gunzip failed: $GunzipError\n";
+X             my @file2 = read_file($output_filename);
+X    
+X             my @grep_1 = grep(/^PRT ATOM/, @file2); foreach (@grep_1) {$_ =~ s/PRT //g ;}  
+X             write_file( $tmpfil1, @grep_1 ) ;
+X             my $template_seq = pdb2seq(@grep_1); 
+X             my $seq_global = get_identity($target_seq,$template_seq);
+X             
+X             if ($seq_global <= $thresh_seqid)
+X             {
+X              print '.';
+X
+X              my @template_int = grep(/^INF/, @file2);
+X              my $receptor_chainID = substr($template,4,1);
+X	      my @temp_inter_resno1=();my @temp_inter_resno=();my @temp_inter_resi=();
+X              foreach my $line2 (@template_int) 
+X              {
+X               my $chain =substr($line2,27,1);
+X               if ($chain eq $receptor_chainID ) 
+X                {
+X                 my $resno = substr($line2,28,4)*1;
+X                 my $resi =  substr($line2,23,3) ;
+X                 push(@temp_inter_resno,$resno);
+X                 push(@temp_inter_resi,$resi); 
+X                }
+X               }
+X  
+X              my ($length_targ2,$length_temp2,$tmscore2,$rmsd2,$aln_length2,$seq_id2,$aln_temp2,$aln_dots2,$aln_targ2, @mat2) = &tmscore( $tmpfil1,$tmpfil0);
+X              $target_length = $length_targ2 ;
+X              #print "$template $tmscore2\n";
+X              if ($tmscore2 >= $thresh_tmscore)
+X                {
+X                 $k1++;
+X                 my @split_1 = split (/\s+/,$mat2[2]);
+X                 my @split_2 = split (/\s+/,$mat2[3]);
+X                 my @split_3 = split (/\s+/,$mat2[4]);
+X
+X                my ($m10,$m11,$m12,$m13) = ($split_1[2],$split_1[3],$split_1[4],$split_1[5]);
+X                my ($m20,$m21,$m22,$m23) = ($split_2[2],$split_2[3],$split_2[4],$split_2[5]);
+X                my ($m30,$m31,$m32,$m33) = ($split_3[2],$split_3[3],$split_3[4],$split_3[5]);
+X
+X                $value1 = sprintf("TEMPLTE %s %4d %6.3f %6.2f %4d %6.3f %6.3f",$template,$length_temp2,$tmscore2,$rmsd2,$aln_length2,$seq_global,$seq_id2);
+X                $value2 = "ALIGNMENT $aln_temp2 $aln_targ2";
+X                $value3 = "ROTMTRX $template $m10 $m11 $m12 $m13 $m20 $m21 $m22 $m23 $m30 $m31 $m32 $m33";
+X                $key1 = $template;
+X                $h1{$key1} = $value1 ; 
+X                $h2{$key1} = $value2 ;$h20{$key1}=$aln_dots2;
+X                $h3{$key1} = $value3 ;
+X                $h5{$key1} = [@temp_inter_resi];
+X                $h6{$key1} = [@temp_inter_resno];
+X
+X
+X                 my @grep_3 = grep (/^HBO/,@file2);foreach (@grep_3) {$_ =~ s/HBN //g ;}
+X                 my @grep_4 = grep (/^SBR/,@file2);foreach (@grep_4) {$_ =~ s/SLT //g ;}
+X                 my @grep_5 = grep (/^CON/,@file2);foreach (@grep_5) {$_ =~ s/CON //g ;}
+X                 $hbond{$key1}=[@grep_3] if [@grep_3] ;
+X                 $salt{$key1}=[@grep_4] if [@grep_4];
+X                 $contacts{$key1}=[@grep_5] if [@grep_4];
+X                }
+X               }
+X      }
+X   }
+X }
+X 
+X my @out_file_1 ;
+X foreach my $y(keys %h2)
+X  {
+X   my @split_line1 = split(/\s+/,$h2{$y});
+X   my @split_line2 = split(/\s+/,$h1{$y});
+X   my $line1=">$y $split_line2[2] $split_line2[5] $split_line2[3] $split_line2[4] $split_line2[6]";
+X   my $line2=$split_line1[1];
+X   my $line4=$split_line1[2];
+X   my $line3=$h20{$y};
+X   my $line5="*";
+X   push (@out_file_1,"$line1\n$line2\n$line3\n$line4\n$line5\n");
+X  } 
+X 
+X my $t1 = Benchmark->new;
+X my $td01 = timediff($t1, $t0);
+X 
+X if ( $k1 > 1 )
+X {
+X  print " $k1 templates found\n\n";
+X }
+X elsif ( $k1 == 1 )
+X {
+X  print " $k1 template found\n\n";
+X }
+X else
+X {
+X  print " no templates found\n";
+X  
+X  my $t4 = Benchmark->new;
+X  
+X  printf("\n------------------------------------------------------------\n");
+X  printf("Walltime: %s\n", timestr(timediff($t4, $t0)));
+X  printf("------------------------------------------------------------\n");
+X  
+X  exit(0);
+X }
+X 
+X##section3.2###############################################################################################
+X# This section identifies all the ASA residues of the input target residues
+X# Assigns residue interface propensity to all surface residues.
+X
+X my $y2 = substr($tmpfil0, 0, index($tmpfil0, '.')); 
+X my $y3 = $y2.".rsa";
+X   sub naccess 
+X {
+X   my $run_naccess =$env_naccess;
+X   open (FH, "$run_naccess $_[0] |");
+X     my @naccess_out = <FH>;
+X   close FH ; 
+X   my @rsa = read_file("$y3") if ( -e "$y3" );
+X   return (@rsa);
+X  }
+X
+X my $remark = 'REM';
+X my (@rsa1)=naccess($tmpfil0);  
+X my @rsa2 = grep( !/^$remark/,@rsa1); 
+X
+X my %res_name ;
+X my %naccess; my $key_naccess; my $start = 'RES';
+X my %rip ; 
+X foreach my $y7 (@rsa2)
+X  {
+X   if ( substr($y7, 0, 3) eq "RES" )
+X    {
+X      my @split_naccess = split (/\s+/,$y7);
+X      my $key_naccess = $split_naccess[3];
+X      my $res_type = $split_naccess[1];
+X      $res_name{$key_naccess} = $res_type ;
+X      if ($split_naccess[5]>5)
+X       {
+X        my $ripx = 0 ; 
+X        my $nacess_scale = scale($split_naccess[5],5,125);
+X        $naccess{$key_naccess} = $nacess_scale;
+X         if ($res_type eq "TRP"){$ripx= 0.83;}
+X         elsif ($res_type eq "PHE"){$ripx= 0.82;}
+X         elsif ($res_type eq "MET"){$ripx= 0.66;}
+X         elsif ($res_type eq "TYR"){$ripx= 0.66;}
+X         elsif ($res_type eq "ILE"){$ripx= 0.44;}
+X         elsif ($res_type eq "CYS"){$ripx= 0.43;}
+X         elsif ($res_type eq "HIS"){$ripx= 0.41;}
+X         elsif ($res_type eq "LEU"){$ripx= 0.40;}
+X         elsif ($res_type eq "ARG"){$ripx= 0.27;}
+X         elsif ($res_type eq "VAL"){$ripx= 0.27;}
+X         elsif ($res_type eq "ASN"){$ripx= 0.12;}
+X         elsif ($res_type eq "ALA"){$ripx= -0.17;}
+X         elsif ($res_type eq "ASP"){$ripx= -0.38;}
+X         elsif ($res_type eq "GLN"){$ripx= -0.11;}
+X         elsif ($res_type eq "GLU"){$ripx= -0.13;}
+X         elsif ($res_type eq "GLY"){$ripx= -0.07;}
+X         elsif ($res_type eq "LYS"){$ripx= -0.36;}
+X         elsif ($res_type eq "PRO"){$ripx= -0.25;}
+X         elsif ($res_type eq "SER"){$ripx= -0.33;}
+X         elsif ($res_type eq "THR"){$ripx= -0.18;}
+X         my $ripx_scale = scale($ripx,-0.38,0.83);
+X         $rip{$key_naccess} = $ripx_scale;
+X       }
+X    }
+X  }  
+X#print "Key: $_ and Value: $naccess{$_}\n" foreach (sort {$a<=>$b} keys %naccess); exit 0 ;
+X##section3.3###############################################################################################
+X# This section  parses .prf file and finds the entropy of all surface residues of the input target residues 
+X
+X my @value_prf; my $key_prf=(); my %prf1;my %entropy;
+X my $prf_count = 0 ;
+X foreach my $y1 (@prf)
+X  {
+X   if ( substr($y1, 0, 1) ne ">" )
+X    {
+X      $prf_count++;
+X      my @split_3 = split (/\s+/,$y1);
+X      $key_prf =$prf_count;
+X      @value_prf = ();
+X      foreach (1 .. 20)
+X       {
+X         push(@value_prf,$split_3[$_]);
+X        }
+X     }
+X    $prf1{$key_prf} = [@value_prf] if $key_prf;
+X   }
+X
+X foreach my $y2 (sort {$a<=>$b} keys %prf1)
+X   {
+X    my $E = 0 ;
+X    foreach (@{$prf1{$y2}})
+X     {
+X      if ($_ != 0)
+X       {
+X        my $E1 = ($_)*(log($_)/log(2));
+X        $E = $E + $E1 ;
+X       }
+X     }
+X    my $E_scale=scale(-$E,0,4.24870939634279);
+X    $entropy{$y2}=$E_scale;
+X    }
+X
+X##section3.4###############################################################################################
+X 
+X # efppi.1.0 #my @propensity = (0.43,0.66,0.82,0.44,0.40,0.27,0.83,0.66,-0.17,-0.07,-0.18,-0.33,-0.11,0.12,-0.13,-0.38,0.41,0.27,-0.36,-0.25);
+X
+X my %psip ;my $PSIP ;
+X my @propensity = (-0.17,0.27,0.12,-0.38,0.43,-0.11,-0.13,-0.07,0.41,0.44,0.40,-0.36,0.66,0.82,-0.25,-0.33,-0.18,0.83,0.66,0.27);
+X # order of AA in PROFILEPRO A R N D C Q E G H I L K M F P S T W Y V
+X foreach my $y3 (keys %prf1)
+X   {
+X    $PSIP = 0 ;
+X    for (0 ..19)
+X     {
+X      if (${$prf1{$y3}}[$_]!= 0)
+X       {
+X        my $E1 = ${$prf1{$y3}}[$_]*$propensity[$_];
+X        $PSIP = $PSIP + $E1 ;
+X       }
+X     }
+X    my $PSIP_scale = scale($PSIP,-0.38,0.83);
+X    $psip{$y3}=$PSIP_scale;
+X    }
+X
+X##section5#################################################################################################
+X
+X my (%h7); my (%p1); my ($m1,$m2);  
+X foreach my $key_chk2 (keys %h6)
+X  {
+X   my $q = $h2{$key_chk2};
+X   my @split_5 = split (/\s+/,$q);
+X   my $aln_temp3 = $split_5[1];
+X   my $aln_targ3 = $split_5[2];
+X   my @inter_resi = @{$h6{$key_chk2}};
+X   my $length = length ($aln_targ3);
+X   undef %p1;
+X   foreach (@inter_resi)
+X     {
+X      if (exists $p1{$_}){$p1{$_}=$p1{$_}+1;}
+X      else {$p1{$_}=1;}
+X      } 
+X    my $out = map_alignments($aln_targ3,$aln_temp3,\%p1, \%h7, $target_length);
+X    %h7 = %{$out};
+X    }
+X
+X  my $h8_out = find_fraction(\%h7);
+X  my %h8 = %{$h8_out};my %h81;
+X
+X  foreach (keys %naccess)
+X   { 
+X    if (!exists $h8{$_}) {$h81{$_}=-1;$h8{$_}=0;}
+X    else {$h81{$_}=scale($h8{$_},0,1)}  
+X   }
+X
+X#foreach ( sort{$a<=>$b} keys %h8 ) { if ($h8{$_}>0.055){push(@predicted,$_)} };
+X
+X##section6#################################################################################################
+X# making input for lib-svm
+X
+X my @value9; my %h9;
+X my @value10; my %h10;
+X foreach my $y (keys %naccess)
+X  {
+X   @value9 = ();  @value10 = ();
+X   push (@value9,$naccess{$y});push (@value10,"1:".$naccess{$y});
+X   push (@value9,$rip{$y})  ;push (@value10,"2:".$rip{$y});
+X   push (@value9,$entropy{$y});push (@value10,"3:".$entropy{$y});
+X   push (@value9,$psip{$y});push (@value10,"4:".$psip{$y});
+X   push (@value9,$h81{$y}) if ($h81{$y}); push (@value10,"5:".$h81{$y}) if ($h81{$y});
+X   push (@value9,"-1") if !($h81{$y}); push (@value10,"5:-1") if !($h81{$y});
+X   $h9{$y} = [@value9]; $h10{$y} = [@value10];
+X  }
+X
+X##section7.1###############################################################################################
+X
+Xprint "Applying SVM ... ";
+X
+X## Prepare data for svm_predict##
+X
+X my @svm_input;
+X foreach (sort {$a<=>$b} keys %h10)
+X   {
+X    my $i = 0;
+X    foreach (@{$h10{$_}})
+X     {
+X      $i++;
+X      if ($i == 1) {push(@svm_input,"0 $_ ");}
+X      else {push(@svm_input,"$_ ") ;}
+X     }
+X    push(@svm_input,"\n") ;
+X   }
+X
+X 
+Xwrite_file("svm_input_scale",@svm_input );
+X
+X## svm_predict ##
+X
+X my $svm_predict = $env_libsvm;  
+X open (FH, "$svm_predict -b 1 svm_input_scale $env_svm svm.prediction 2>&1|");
+X   my @svm_out2 = <FH>;
+X close FH ;  
+X
+X my @svm_prediction;
+X if ( -e "svm.prediction" ) {@svm_prediction = read_file("svm.prediction") ;}
+X else {die "svm.prediction failed"};
+X
+X## parse svm.prediction ##
+X my @svm_prediction1 = grep (!/labels/,@svm_prediction);
+X my @svm_in_keys = sort {$a<=>$b} keys %h10 ;
+X if ($#svm_in_keys != $#svm_prediction1){die "could not map keys of svm prediction";}
+X 
+X my %sv_prediction ; 
+X foreach (0..$#svm_prediction1)
+X  {
+X   my $key = $svm_in_keys[$_];
+X   my @split = split (/\s+/,$svm_prediction1[$_]);
+X   $sv_prediction{$key}=$split[2];
+X   }
+X
+X chdir $dir1;
+X print "done\n\n";
+X
+X##section7.2###############################################################################################
+X
+X print "Applying NBC ... ";
+X
+X my $nb_model = AI::NaiveBayes1->import_from_YAML_file("$env_nb");
+X
+X my %nb_prediction ;
+Xforeach (sort {$a<=>$b} keys %h9)
+X {
+X  my $p1 = 0.0;
+X  my $p2 = 0.0;
+X  my @array = @{$h9{$_}};
+X  my $p3 = $nb_model->predict(attributes=>{RSA=>$array[0],RIP=>$array[1],ENTROPY=>$array[2],PSIP=>$array[3],FRACTION=>$array[4]});
+X  $p1 = $p3->{'TRUE'};
+X  $p2 = $p3->{'FALSE'};
+X  $nb_prediction{$_}=$p1;
+X } 
+X my $t2 = Benchmark->new;
+X my $td12 = timediff($t2, $t1);
+X 
+X print "done\n\n";
+X 
+X##section8#################################################################################################
+X## This section predictshydrogen bonds, hydrophobic bcontacts , aromatic contacts an dsalt bridges.
+X
+X
+X my (%hbond2, %salt2,%hydrophobic2,%aromatic2);
+X my (%hbond3, %salt3,%hydrophobic3,%aromatic3); 
+X my ($salt1,$key_s1);
+X
+X ## HBOND ##  
+X foreach my $hkey1(keys %hbond)
+X  {
+X   my %hbond1 = (); 
+X   my $template_id = $hkey1 ; 
+X   my $template_chn = substr($template_id,4,1);
+X   my @template_hbond = @{$hbond{$hkey1}};
+X
+X   my $q2 = $h2{$hkey1};
+X   my @split_h0 = split (/\s+/,$q2);
+X   my $aln_temp4 = $split_h0[1];
+X   my $aln_targ4 = $split_h0[2];
+X   my $length_aln = length ($aln_targ4);
+X    
+X   foreach my $h1(@template_hbond)
+X    {
+X     $h1=~ s/^\s+|\s+$//g;
+X     my @split_h1 = split(/\s+/,$h1);
+X     my $chn1_h1 = $split_h1[3]; my $resno1_h1 = $split_h1[4];
+X     my $chn2_h1 = $split_h1[7]; my $resno2_h1 = $split_h1[8];
+X
+X     if ($chn1_h1 eq $template_chn)
+X       {$hbond1{$resno1_h1} = 1;}
+X     elsif ($chn2_h1 eq $template_chn)
+X       {$hbond1{$resno2_h1}= 1;}
+X     } 
+X    my $out1 = map_alignments($aln_targ4,$aln_temp4,\%hbond1, \%hbond2, $target_length);
+X    %hbond2 = %{$out1};
+X   }
+X  my $hbond3_out = find_fraction(\%hbond2);
+X  %hbond3 = %{$hbond3_out};
+X 
+X ## SALT BRIDGES ##
+X foreach my $hkey2(keys %salt)
+X  {
+X   my $template_id = $hkey2 ; 
+X   my $template_chn = substr($template_id,4,1);
+X   my @template_salt = @{$salt{$hkey2}};
+X   my $q2 = $h2{$hkey2};
+X   my @split_h0 = split (/\s+/,$q2);
+X   my $aln_temp4 = $split_h0[1];my $aln_targ4 = $split_h0[2];
+X   my $length_aln = length ($aln_targ4);
+X   my %salt1 = (); 
+X   foreach my $s1(@template_salt)
+X    {
+X     $s1=~ s/^\s+|\s+$//g;
+X     my @split_s1 = split(/\s+/,$s1);
+X     my $chn1_s1 = $split_s1[3]; my $resno1_s1 = $split_s1[4];
+X     my $chn2_s1 = $split_s1[7]; my $resno2_s1 = $split_s1[8];
+X
+X     if ($chn1_s1 eq $template_chn)
+X       {$salt1{$resno1_s1} = 1;}
+X     elsif ($chn2_s1 eq $template_chn)
+X       {$salt1{$resno2_s1}= 1;}
+X     } 
+X    my $out2 = map_alignments($aln_targ4,$aln_temp4,\%salt1, \%salt2, $target_length);
+X    %salt2 = %{$out2};
+X   }
+X my $salt3_out = find_fraction(\%salt2);
+X %salt3 = %{$salt3_out}; 
+X 
+X  my @aromatic=qw/TYR PHE TRP HIS/;
+X  my @apolar=qw/ALA ILE LEU PHE VAL PRO GLY/;
+X  my @salt=qw/ARG LYS GLU ASP/;
+X
+X foreach my $hkey3(keys %contacts)
+X  {
+X   my $template_id = $hkey3 ; 
+X   my $template_chn = substr($template_id,4,1);
+X   my @template_contacts = @{$contacts{$hkey3}};
+X
+X   my $q2 = $h2{$hkey3};
+X   my @split_h0 = split (/\s+/,$q2);
+X   my $aln_temp4 = $split_h0[1];my $aln_targ4 = $split_h0[2];
+X   my $length_aln = length ($aln_targ4);
+X   my %aromatic1 = () ; my %hydrophobic1 = () ;
+X
+X   ## AROMATIC CONTACTS ## 
+X   foreach my $a1 (@template_contacts)
+X    {
+X     $a1=~ s/^\s+|\s+$//g;
+X     my @split_line_a1 = split(/\s+/,$a1);
+X     my $chn1=$split_line_a1[7];
+X     my $chn2=$split_line_a1[15];
+X     my $i_res1=$split_line_a1[3];
+X     my $i_res2=$split_line_a1[11];
+X     my $i_type=$split_line_a1[22];
+X     #my @hphobic=qw/TYR PHE TRP HIS/;
+X     #my @apolar=qw/ALA ILE LEU PHE VAL PRO GLY/;
+X     if($chn1 ne $chn2 && $i_type=~m/(S-S)/i && /$i_res1/i ~~ @aromatic && /$i_res2/i ~~ @aromatic )
+X      {
+X       my $chn1_resno=$split_line_a1[1] ;
+X       my $chn2_resno=$split_line_a1[5] ;
+X       if ($chn1 eq $template_chn)
+X        {
+X         $aromatic1{$chn1_resno} = 1;
+X         }
+X       elsif ($chn2 eq $template_chn)
+X        {
+X         $aromatic1{$chn2_resno}=1;
+X        }
+X      }
+X     if($chn1 ne $chn2 && $i_type=~m/(S-S)/i && /$i_res1/i ~~ @apolar && /$i_res2/i ~~ @apolar )
+X      {
+X       my $chn1_resno=$split_line_a1[1] ;
+X       my $chn2_resno=$split_line_a1[5] ;
+X       if ($chn1 eq $template_chn)
+X        {
+X         $hydrophobic1{$chn1_resno} = 1;
+X         }
+X       elsif ($chn2 eq $template_chn)
+X        {
+X         $hydrophobic1{$chn2_resno}=1;
+X        }
+X      }
+X    }
+X    my $out3 = map_alignments($aln_targ4,$aln_temp4,\%aromatic1, \%aromatic2, $target_length);
+X    %aromatic2 = %{$out3}; 
+X    my $out4 = map_alignments($aln_targ4,$aln_temp4,\%aromatic1, \%aromatic2, $target_length);
+X    %hydrophobic2 = %{$out4};
+X }
+X
+X  my $aromatic3_out = find_fraction(\%aromatic2);
+X  %aromatic3 = %{$aromatic3_out};
+X
+X my $hydrophobic3_out = find_fraction(\%hydrophobic2);
+X %hydrophobic3 = %{$hydrophobic3_out};
+X
+X my @out_file_2;my $j1 = 0; my $j2 = 0 ; my %star;
+X my $confidence_sum=0;my $confidence =0;  
+X foreach ( sort{$a<=>$b} keys %naccess)
+X {
+X   $j1++;
+X  if ($sv_prediction{$_}>0.202 && $nb_prediction{$_}>0.178 && exists $h81{$_} )
+X   {
+X    push (@out_file_2,sprintf("RESIDUE %4s %4d %s %4d %8.5f %8.5f %9.6f\n","<*>",$j1,$res_name{$_},$_,$h8{$_},$sv_prediction{$_},$nb_prediction{$_}));
+X    $star{$_}=1;
+X    $j2++;
+X    $confidence_sum = $confidence_sum + $sv_prediction{$_}*$nb_prediction{$_};
+X   }
+X  elsif ( exists $h81{$_} ) 
+X   {
+X    push (@out_file_2,sprintf("RESIDUE %4s %4d %s %4d %8.5f %8.5f %9.6f\n"," ",$j1,$res_name{$_},$_,$h8{$_},$sv_prediction{$_},$nb_prediction{$_}));
+X   }
+X } 
+X 
+X $confidence = $confidence_sum/$j2 if ($j2>0) ;
+X
+X my $confidence_out = 0;
+X if ($confidence>=0.5){$confidence_out="HIGH";}
+X elsif ($confidence>=0.25 && $confidence<0.5){$confidence_out="MEDIUM";}
+X else {$confidence_out="LOW";}
+X unshift (@out_file_2, "CONFDNC $confidence_out\n");
+X unshift (@out_file_2, "LIBRARY $version1[0]\n");
+X 
+X print "Prediction confidence: $confidence_out\n"; 
+X
+X foreach (sort{$a cmp $b} keys %h1){push (@out_file_2,"$h1{$_}\n");}
+X foreach (sort{$a cmp $b} keys %h3){push (@out_file_2,"$h3{$_}\n");}
+X
+X foreach (sort{$a <=> $b} keys %hbond3){
+X   if ($hbond3{$_} > 0 && exists $naccess{$_}){
+X    if (exists $star{$_} && $hbond3{$_} > 0.041){ push (@out_file_2, sprintf("INTRCTN HBND %-4s%-6s %-6s %9.6f\n","<*>",$res_name{$_},$_,$hbond3{$_}));}
+X    else {push (@out_file_2, sprintf("INTRCTN HBND %-4s%-6s %-6s %9.6f\n"," ",$res_name{$_},$_,$hbond3{$_}));}
+X   }}
+X
+X foreach (sort{$a <=> $b} keys %salt3){
+X  if ($salt3{$_} > 0 && exists $naccess{$_}  && /$res_name{$_}/i ~~ @salt ) {
+X   if (exists $star{$_} && $salt3{$_} > 0.006 ) { push (@out_file_2, sprintf("INTRCTN SALT %-4s%-6s %-6s %9.6f\n","<*>",$res_name{$_},$_,$salt3{$_}));}
+X   else { push (@out_file_2, sprintf("INTRCTN SALT %-4s%-6s %-6s %9.6f\n"," ",$res_name{$_},$_,$salt3{$_}));}
+X  }}
+X
+X foreach (sort{$a <=> $b} keys %hbond3){
+X  if ($hydrophobic3{$_}>0 && exists $naccess{$_} && /$res_name{$_}/i ~~ @apolar){
+X   if (exists $star{$_} && $hydrophobic3{$_}>0.005) { push (@out_file_2, sprintf("INTRCTN HYFB %-4s%-6s %-6s %9.6f\n","<*>",$res_name{$_},$_,$hydrophobic3{$_}));}
+X    else { push (@out_file_2, sprintf("INTRCTN HYFB %-4s%-6s %-6s %9.6f\n"," ",$res_name{$_},$_,$hydrophobic3{$_}));}
+X   }}
+X
+X foreach (sort{$a <=> $b} keys %hbond3){
+X  if ($aromatic3{$_} > 0 && exists $naccess{$_} && /$res_name{$_}/i ~~ @aromatic){ 
+X   if  (exists $star{$_} && $aromatic3{$_} > 0.005 ) {push (@out_file_2, sprintf("INTRCTN AROM %-4s%-6s %-6s %9.6f\n","<*>",$res_name{$_},$_,$aromatic3{$_}));}
+X    else {push (@out_file_2, sprintf("INTRCTN AROM %-4s%-6s %-6s %9.6f\n"," ",$res_name{$_},$_,$aromatic3{$_}));}
+X   }} 
+X
+X my $out_file_1_name;my $out_file_2_name;
+X $out_file_1_name= $target_id.".alignments.dat";
+X write_file($out_file_1_name,@out_file_1);
+X $out_file_2_name= $target_id.".sites.dat";
+X write_file($out_file_2_name,@out_file_2);
+X##section9#################################################################################################
+X
+X my $t3 = Benchmark->new;
+X 
+X printf("\n------------------------------------------------------------\n");
+X printf("Walltime: %s\n", timestr(timediff($t3, $t0)));
+X printf("------------------------------------------------------------\n");
+X 
+X exit(0);
+X
+X__DATA__
+X   A  R  N  D  C  Q  E  G  H  I  L  K  M  F  P  S  T  W  Y  V  B  Z  X
+XA  5 -2 -1 -2 -1 -1 -1  0 -2 -1 -2 -1 -1 -3 -1  1  0 -3 -2  0 -2 -1 -1
+XR -2  7 -1 -2 -4  1  0 -3  0 -4 -3  3 -2 -3 -3 -1 -1 -3 -1 -3 -1  0 -1
+XN -1 -1  7  2 -2  0  0  0  1 -3 -4  0 -2 -4 -2  1  0 -4 -2 -3  4  0 -1
+XD -2 -2  2  8 -4  0  2 -1 -1 -4 -4 -1 -4 -5 -1  0 -1 -5 -3 -4  5  1 -1
+XC -1 -4 -2 -4 13 -3 -3 -3 -3 -2 -2 -3 -2 -2 -4 -1 -1 -5 -3 -1 -3 -3 -2
+XQ -1  1  0  0 -3  7  2 -2  1 -3 -2  2  0 -4 -1  0 -1 -1 -1 -3  0  4 -1
+XE -1  0  0  2 -3  2  6 -3  0 -4 -3  1 -2 -3 -1 -1 -1 -3 -2 -3  1  5 -1
+XG  0 -3  0 -1 -3 -2 -3  8 -2 -4 -4 -2 -3 -4 -2  0 -2 -3 -3 -4 -1 -2 -2
+XH -2  0  1 -1 -3  1  0 -2 10 -4 -3  0 -1 -1 -2 -1 -2 -3  2 -4  0  0 -1
+XI -1 -4 -3 -4 -2 -3 -4 -4 -4  5  2 -3  2  0 -3 -3 -1 -3 -1  4 -4 -3 -1
+XL -2 -3 -4 -4 -2 -2 -3 -4 -3  2  5 -3  3  1 -4 -3 -1 -2 -1  1 -4 -3 -1
+XK -1  3  0 -1 -3  2  1 -2  0 -3 -3  6 -2 -4 -1  0 -1 -3 -2 -3  0  1 -1
+XM -1 -2 -2 -4 -2  0 -2 -3 -1  2  3 -2  7  0 -3 -2 -1 -1  0  1 -3 -1 -1
+XF -3 -3 -4 -5 -2 -4 -3 -4 -1  0  1 -4  0  8 -4 -3 -2  1  4 -1 -4 -4 -2
+XP -1 -3 -2 -1 -4 -1 -1 -2 -2 -3 -4 -1 -3 -4 10 -1 -1 -4 -3 -3 -2 -1 -2
+XS  1 -1  1  0 -1  0 -1  0 -1 -3 -3  0 -2 -3 -1  5  2 -4 -2 -2  0  0 -1
+XT  0 -1  0 -1 -1 -1 -1 -2 -2 -1 -1 -1 -1 -2 -1  2  5 -3 -2  0  0 -1  0
+XW -3 -3 -4 -5 -5 -1 -3 -3 -3 -3 -2 -3 -1  1 -4 -4 -3 15  2 -3 -5 -2 -3
+XY -2 -1 -2 -3 -3 -1 -2 -3  2 -1 -1 -2  0  4 -3 -2 -2  2  8 -1 -3 -2 -1
+XV  0 -3 -3 -4 -1 -3 -3 -4 -4  4  1 -3  1 -1 -3 -2  0 -3 -1  5 -4 -3 -1
+XB -2 -1  4  5 -3  0  1 -1  0 -4 -4  0 -3 -4 -2  0  0 -5 -3 -4  5  2 -1
+XZ -1  0  0  1 -3  4  5 -2  0 -3 -3  1 -1 -4 -1  0 -1 -2 -2 -3  2  5 -1
+XX -1 -1 -1 -1 -2 -1 -1 -2 -1 -1 -1 -1 -1 -2 -2 -1  0 -3 -1 -1 -1 -1 -1
+END-of-efindsiteppi
+exit
+
